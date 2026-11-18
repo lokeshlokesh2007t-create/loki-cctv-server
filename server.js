@@ -633,16 +633,16 @@ app.get('/', (req, res) => {
 
     function applyRot(camId) {
       if (camId === 1) {
-        document.getElementById('imgCam1').style.transform = `rotate(${rotCam1}deg)`;
-        document.getElementById('rotBtn1').innerText = `🔄 Rotate Cam 1 (${rotCam1}°)`;
+        document.getElementById('imgCam1').style.transform = 'rotate(' + rotCam1 + 'deg)';
+        document.getElementById('rotBtn1').innerText = '🔄 Rotate Cam 1 (' + rotCam1 + '°)';
         localStorage.setItem('loki_cam1_rot', rotCam1);
       } else if (camId === 2) {
-        document.getElementById('imgCam2').style.transform = `rotate(${rotCam2}deg)`;
-        document.getElementById('rotBtn2').innerText = `🔄 Rotate Cam 2 (${rotCam2}°)`;
+        document.getElementById('imgCam2').style.transform = 'rotate(' + rotCam2 + 'deg)';
+        document.getElementById('rotBtn2').innerText = '🔄 Rotate Cam 2 (' + rotCam2 + '°)';
         localStorage.setItem('loki_cam2_rot', rotCam2);
       } else if (camId === 3) {
-        document.getElementById('imgCam3').style.transform = `rotate(${rotCam3}deg)`;
-        document.getElementById('rotBtn3').innerText = `🔄 Rotate Cam 3 (${rotCam3}°)`;
+        document.getElementById('imgCam3').style.transform = 'rotate(' + rotCam3 + 'deg)';
+        document.getElementById('rotBtn3').innerText = '🔄 Rotate Cam 3 (' + rotCam3 + '°)';
         localStorage.setItem('loki_cam3_rot', rotCam3);
       }
     }
