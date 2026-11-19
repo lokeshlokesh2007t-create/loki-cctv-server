@@ -415,51 +415,231 @@ app.get('/download', sendApkDownload);
 app.get('/app', sendApkDownload);
 
 // =====================================================================================
-// 6. DEDICATED APP VIEW (Optimized for Android App & Fast WebView 3s Auto-Refresh)
+// 6. DEDICATED APP & ZOOM CLOSE-UP VIEW (Optimized for Android App & Mobile Browsers)
 // =====================================================================================
-app.get('/app-view', (req, res) => {
-  const requestedCam = req.query.cam;
+function handleAppView(req, res) {
+  let requestedCam = req.query.cam || req.params.camId;
   
   if (requestedCam === '1' || requestedCam === '2' || requestedCam === '3') {
+    // Single Camera Full-Screen Close-Up Zoom View
     const cId = parseInt(requestedCam, 10);
-    const cName = cameras[cId].name;
+    const camObj = cameras[cId] || cameras[1];
+    const cName = camObj.name;
     return res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>` + cName + `</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
+  <title>` + cName + ` - Zoom Close-Up</title>
   <style>
-    * { margin:0; padding:0; box-sizing:border-box; background:#0b0f19; font-family:'Segoe UI',sans-serif; }
-    body { padding:8px; display:flex; flex-direction:column; height:100vh; }
-    .header { background:#1e293b; color:#38bdf8; font-size:13px; font-weight:bold; padding:8px 12px; border-radius:8px 8px 0 0; display:flex; justify-content:space-between; align-items:center; }
-    .badge { font-size:11px; font-weight:bold; background:#064e3b; color:#34d399; padding:2px 8px; border-radius:10px; }
-    .feed { flex:1; background:#000; display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:0 0 8px 8px; }
-    img { width:100%; height:100%; object-fit:contain; }
+    * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',system-ui,sans-serif; background:#0b0f19; }
+    body { padding:6px; display:flex; flex-direction:column; height:100vh; overflow:hidden; }
+    
+    .header-bar {
+      background:#161e2e;
+      border:1px solid #1f293d;
+      border-radius:10px 10px 0 0;
+      padding:8px 12px;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+    }
+    .cam-title { color:#38bdf8; font-size:13px; font-weight:bold; display:flex; align-items:center; gap:6px; }
+    .badge { font-size:10px; font-weight:bold; background:#064e3b; color:#34d399; padding:3px 8px; border-radius:12px; border:1px solid #059669; }
+    
+    .zoom-toolbar {
+      background:#0f172a;
+      border-left:1px solid #1f293d;
+      border-right:1px solid #1f293d;
+      padding:6px 8px;
+      display:flex;
+      gap:6px;
+      align-items:center;
+      overflow-x:auto;
+      white-space:nowrap;
+    }
+    .btn {
+      background:#1e293b;
+      color:#e2e8f0;
+      border:1px solid #334155;
+      padding:6px 12px;
+      border-radius:6px;
+      font-size:11px;
+      font-weight:bold;
+      cursor:pointer;
+      transition:0.15s;
+    }
+    .btn:active, .btn.active {
+      background:#0284c7;
+      color:#fff;
+      border-color:#38bdf8;
+    }
+    .btn-purple { background:#7c3aed; color:#fff; border-color:#8b5cf6; }
+    .btn-green { background:#059669; color:#fff; border-color:#10b981; }
+
+    .viewport {
+      flex:1;
+      background:#000;
+      border:1px solid #1f293d;
+      border-radius:0 0 10px 10px;
+      position:relative;
+      overflow:hidden;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      touch-action:none;
+    }
+    
+    .img-container {
+      width:100%;
+      height:100%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      transform-origin:center center;
+      transition:transform 0.15s ease-out;
+      cursor:grab;
+    }
+    .img-container:active { cursor:grabbing; }
+
+    img#feedImg {
+      max-width:100%;
+      max-height:100%;
+      width:auto;
+      height:auto;
+      object-fit:contain;
+      user-select:none;
+      -webkit-user-drag:none;
+      pointer-events:auto;
+    }
+    img#feedImg.fill-mode {
+      width:100%;
+      height:100%;
+      object-fit:cover;
+    }
+
+    .zoom-hint {
+      position:absolute;
+      bottom:8px;
+      left:50%;
+      transform:translateX(-50%);
+      background:rgba(15,23,42,0.88);
+      border:1px solid #334155;
+      color:#94a3b8;
+      font-size:10px;
+      padding:3px 12px;
+      border-radius:12px;
+      pointer-events:none;
+      white-space:nowrap;
+    }
   </style>
 </head>
 <body>
-  <div class="header">
-    <span>📹 ` + cName + `</span>
-    <span class="badge" id="b">● 3s AUTO</span>
+  <div class="header-bar">
+    <div class="cam-title">
+      <span>📹 ` + cName + `</span>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;">
+      <a href="/app-view" class="btn btn-purple" style="text-decoration:none;padding:4px 10px;font-size:10px;">⬅️ All 3 Cams</a>
+      <span class="badge" id="liveBadge">● 3s LIVE</span>
+    </div>
   </div>
-  <div class="feed">
-    <img id="f" src="/capture?cam=` + cId + `" alt="Camera Feed" />
+
+  <div class="zoom-toolbar">
+    <span style="font-size:11px;color:#94a3b8;font-weight:bold;margin-right:2px;">🔍 ZOOM:</span>
+    <button class="btn active" id="z1" onclick="setZoom(1.0)">1.0x Normal</button>
+    <button class="btn" id="z15" onclick="setZoom(1.5)">1.5x Close</button>
+    <button class="btn" id="z2" onclick="setZoom(2.0)">2.0x Zoom</button>
+    <button class="btn" id="z3" onclick="setZoom(3.0)">3.0x Max</button>
+    <button class="btn" id="fitBtn" onclick="toggleFill()">↔️ Fill/Fit</button>
+    <button class="btn" onclick="rotateCam()">🔄 Rotate</button>
+    <button class="btn btn-green" onclick="window.open('/capture?cam=` + cId + `','_blank')">📸 HD</button>
   </div>
+
+  <div class="viewport" id="viewport">
+    <div class="img-container" id="container">
+      <img id="feedImg" src="/capture?cam=` + cId + `" alt="Camera Feed" />
+    </div>
+    <div class="zoom-hint" id="zoomHint">Tap 1.5x, 2.0x or pinch to zoom close-up</div>
+  </div>
+
   <script>
     var cId = ` + cId + `;
-    var img = document.getElementById('f');
-    var badge = document.getElementById('b');
+    var currentZoom = 1.0;
+    var currentRot = parseInt(localStorage.getItem('loki_app_rot_' + cId) || '0', 10);
+    var isFill = false;
+    var posX = 0, posY = 0;
+    var isDragging = false, startX = 0, startY = 0;
+
+    var container = document.getElementById('container');
+    var feedImg = document.getElementById('feedImg');
+    var liveBadge = document.getElementById('liveBadge');
+    var viewport = document.getElementById('viewport');
+    var hint = document.getElementById('zoomHint');
+
+    function applyTransform() {
+      container.style.transform = 'translate(' + posX + 'px, ' + posY + 'px) scale(' + currentZoom + ') rotate(' + currentRot + 'deg)';
+    }
+
+    function setZoom(lvl) {
+      currentZoom = lvl;
+      if (lvl === 1.0) { posX = 0; posY = 0; }
+      ['z1','z15','z2','z3'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.classList.remove('active');
+      });
+      if (lvl === 1.0) document.getElementById('z1').classList.add('active');
+      else if (lvl === 1.5) document.getElementById('z15').classList.add('active');
+      else if (lvl === 2.0) document.getElementById('z2').classList.add('active');
+      else if (lvl === 3.0) document.getElementById('z3').classList.add('active');
+      hint.innerText = (lvl > 1.0) ? ('🔍 ' + lvl + 'x Zoom: Drag with finger to move around') : 'Tap 1.5x, 2.0x or pinch to zoom close-up';
+      applyTransform();
+    }
+
+    function toggleFill() {
+      isFill = !isFill;
+      feedImg.className = isFill ? 'fill-mode' : '';
+      document.getElementById('fitBtn').innerText = isFill ? '↕️ Fit Box' : '↔️ Fill Screen';
+    }
+
+    function rotateCam() {
+      currentRot = (currentRot + 90) % 360;
+      localStorage.setItem('loki_app_rot_' + cId, currentRot);
+      applyTransform();
+    }
+
+    viewport.addEventListener('touchstart', function(e) {
+      if (e.touches.length === 1 && currentZoom > 1.0) {
+        isDragging = true;
+        startX = e.touches[0].clientX - posX;
+        startY = e.touches[0].clientY - posY;
+      }
+    }, { passive: true });
+
+    viewport.addEventListener('touchmove', function(e) {
+      if (isDragging && e.touches.length === 1) {
+        posX = e.touches[0].clientX - startX;
+        posY = e.touches[0].clientY - startY;
+        applyTransform();
+      }
+    }, { passive: true });
+
+    viewport.addEventListener('touchend', function() { isDragging = false; });
+
     function updateFrame() {
       var next = new Image();
       next.onload = function() {
-        img.src = next.src;
+        feedImg.src = next.src;
         var d = new Date();
-        var t = String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0') + ':' + String(d.getSeconds()).padStart(2,'0');
-        badge.innerText = '● LIVE (' + t + ')';
+        var h = String(d.getHours()).padStart(2,'0');
+        var m = String(d.getMinutes()).padStart(2,'0');
+        var s = String(d.getSeconds()).padStart(2,'0');
+        liveBadge.innerText = '● LIVE (' + h + ':' + m + ':' + s + ')';
       };
       next.src = '/capture?cam=' + cId + '&t=' + Date.now();
     }
+
+    applyTransform();
     updateFrame();
     setInterval(updateFrame, 3000);
   </script>
@@ -467,11 +647,12 @@ app.get('/app-view', (req, res) => {
 </html>`);
   }
 
+  // All 3 Cameras Column View (Default)
   res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
   <title>Loki CCTV 3-Camera Live Display</title>
   <style>
     * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',sans-serif; background:#0b0f19; }
@@ -479,22 +660,52 @@ app.get('/app-view', (req, res) => {
     .cam-box { background:#161e2e; border:1px solid #1f293d; border-radius:10px; overflow:hidden; }
     .cam-header { background:#1e293b; color:#38bdf8; font-size:12px; font-weight:bold; padding:6px 10px; display:flex; justify-content:space-between; align-items:center; }
     .badge { font-size:10px; font-weight:bold; background:#064e3b; color:#34d399; padding:2px 8px; border-radius:10px; }
-    .img-wrap { width:100%; height:170px; background:#000; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+    .img-wrap { width:100%; height:170px; background:#000; display:flex; align-items:center; justify-content:center; overflow:hidden; cursor:pointer; position:relative; }
     img { width:100%; height:100%; object-fit:contain; }
+    .zoom-pill { position:absolute; bottom:6px; right:6px; background:rgba(2,132,199,0.85); color:#fff; font-size:10px; font-weight:bold; padding:3px 8px; border-radius:10px; text-decoration:none; }
   </style>
 </head>
 <body>
   <div class="cam-box">
-    <div class="cam-header"><span>📹 CAM 1 (Main S3)</span><span class="badge" id="b1">● 3s AUTO</span></div>
-    <div class="img-wrap"><img id="f1" src="/capture?cam=1" alt="Cam 1" /></div>
+    <div class="cam-header">
+      <span>📹 CAM 1 (Main S3)</span>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <a href="/view?cam=1" style="background:#0284c7;color:#fff;text-decoration:none;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:bold;">🔍 Zoom Close-Up</a>
+        <span class="badge" id="b1">● 3s AUTO</span>
+      </div>
+    </div>
+    <div class="img-wrap" onclick="window.location.href='/view?cam=1'">
+      <img id="f1" src="/capture?cam=1" alt="Cam 1" />
+      <span class="zoom-pill">Tap to Zoom 🔍</span>
+    </div>
   </div>
+
   <div class="cam-box">
-    <div class="cam-header"><span>📹 CAM 2 (Side Angle 1)</span><span class="badge" id="b2">● 3s AUTO</span></div>
-    <div class="img-wrap"><img id="f2" src="/capture?cam=2" alt="Cam 2" /></div>
+    <div class="cam-header">
+      <span>📹 CAM 2 (Side Angle 1)</span>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <a href="/view?cam=2" style="background:#0284c7;color:#fff;text-decoration:none;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:bold;">🔍 Zoom Close-Up</a>
+        <span class="badge" id="b2">● 3s AUTO</span>
+      </div>
+    </div>
+    <div class="img-wrap" onclick="window.location.href='/view?cam=2'">
+      <img id="f2" src="/capture?cam=2" alt="Cam 2" />
+      <span class="zoom-pill">Tap to Zoom 🔍</span>
+    </div>
   </div>
+
   <div class="cam-box">
-    <div class="cam-header"><span>📹 CAM 3 (Side Angle 2)</span><span class="badge" id="b3">● 3s AUTO</span></div>
-    <div class="img-wrap"><img id="f3" src="/capture?cam=3" alt="Cam 3" /></div>
+    <div class="cam-header">
+      <span>📹 CAM 3 (Side Angle 2)</span>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <a href="/view?cam=3" style="background:#0284c7;color:#fff;text-decoration:none;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:bold;">🔍 Zoom Close-Up</a>
+        <span class="badge" id="b3">● 3s AUTO</span>
+      </div>
+    </div>
+    <div class="img-wrap" onclick="window.location.href='/view?cam=3'">
+      <img id="f3" src="/capture?cam=3" alt="Cam 3" />
+      <span class="zoom-pill">Tap to Zoom 🔍</span>
+    </div>
   </div>
   <script>
     function updateCam(id) {
@@ -520,8 +731,12 @@ app.get('/app-view', (req, res) => {
   </script>
 </body>
 </html>`);
-});
+}
 
+app.get('/app-view', handleAppView);
+app.get('/app-view/:camId', handleAppView);
+app.get('/view', handleAppView);
+app.get('/view/:camId', handleAppView);
 app.get('/view/all', (req, res) => { res.redirect('/app-view'); });
 
 // =====================================================================================
