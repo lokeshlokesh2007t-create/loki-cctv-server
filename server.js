@@ -64,24 +64,22 @@ const cameras = {
   }
 };
 
-// Zero-Latency Push-on-Frame Listeners
-const frameWaiters = { 1: [], 2: [], 3: [] };
-
 let pendingCommands = [];
 let commandCounter = 1;
-let cameraStreamClient = null; // Real-Time Push Tunnel Socket
+let cameraStreamClient = null;
 let pendingSpeech = null;
 let speechSeq = 0;
 
 function resolveCamId(req) {
-  const c = req.query.cam || req.headers['x-camera-id'] || req.params.camId;
+  let c = req.query.cam || req.headers['x-camera-id'] || req.params.camId;
+  if (!c && req.query.camId) c = req.query.camId;
   if (c === '2' || c === 2 || c === 'cam2') return 2;
   if (c === '3' || c === 3 || c === 'cam3') return 3;
-  return 1; // Default to Camera 1 for backwards compatibility
+  return 1;
 }
 
 // =====================================================================================
-// 1. FRAME INGESTION ENDPOINTS (Ultra-Fast Event Dispatching)
+// 1. FRAME INGESTION ENDPOINTS (Supports All 3 Cameras)
 // =====================================================================================
 function handleFrameUpload(req, res) {
   const camId = resolveCamId(req);
@@ -92,24 +90,10 @@ function handleFrameUpload(req, res) {
     cam.lastFrameTime = Date.now();
     cam.frameCounter++;
 
-    if (cam.frameCounter === 1 || cam.frameCounter % 30 === 0) {
-      console.log(`[Frame Cam ${camId}] Ingested frame #${cam.frameCounter} (${cam.latestFrame.length} bytes). Push-Listeners: ${(frameWaiters[camId]||[]).length}`);
+    if (cam.frameCounter === 1 || cam.frameCounter % 20 === 0) {
+      console.log(`[Frame Cam ${camId}] Ingested frame #${cam.frameCounter} (${cam.latestFrame.length} bytes). Viewers: ${cam.streamClients.length}`);
     }
 
-    // 1. Instant Push Dispatch to all waiting browser viewers (0ms Latency)
-    const waiters = frameWaiters[camId] || [];
-    frameWaiters[camId] = [];
-    for (let i = 0; i < waiters.length; i++) {
-      try {
-        const clientRes = waiters[i];
-        clientRes.setHeader('Content-Type', 'image/jpeg');
-        clientRes.setHeader('Content-Length', cam.latestFrame.length);
-        clientRes.setHeader('X-Frame-Seq', String(cam.frameCounter));
-        clientRes.end(cam.latestFrame);
-      } catch (e) {}
-    }
-
-    // 2. Broadcast to legacy MJPEG viewers
     for (let i = cam.streamClients.length - 1; i >= 0; i--) {
       const client = cam.streamClients[i];
       try {
@@ -122,7 +106,6 @@ function handleFrameUpload(req, res) {
         cam.streamClients.splice(i, 1);
       }
     }
-
     res.status(200).send('OK');
   } else {
     res.status(400).send('No Frame Data');
@@ -135,96 +118,9 @@ app.post('/api/device/frame', handleFrameUpload);
 app.post('/api/device/frame/:camId', handleFrameUpload);
 
 // =====================================================================================
-// 2. ZERO-LATENCY PUSH-ON-FRAME STREAMING (Lightning Fast)
-// =====================================================================================
-function handleLiveFrame(req, res) {
-  const camId = resolveCamId(req);
-  const cam = cameras[camId] || cameras[1];
-  const clientSeq = parseInt(req.query.seq || '0', 10);
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-
-  // If server already has a newer frame than what client has seen, send it immediately in 0ms!
-  if (cam.latestFrame && cam.frameCounter > clientSeq) {
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Content-Length', cam.latestFrame.length);
-    res.setHeader('X-Frame-Seq', String(cam.frameCounter));
-    return res.end(cam.latestFrame);
-  }
-
-  // Otherwise hold connection and flush immediately the exact millisecond ESP32 pushes!
-  if (!frameWaiters[camId]) frameWaiters[camId] = [];
-  frameWaiters[camId].push(res);
-
-  const timeoutTimer = setTimeout(() => {
-    const idx = frameWaiters[camId] ? frameWaiters[camId].indexOf(res) : -1;
-    if (idx !== -1) frameWaiters[camId].splice(idx, 1);
-    try {
-      if (cam.latestFrame) {
-        res.setHeader('Content-Type', 'image/jpeg');
-        res.setHeader('Content-Length', cam.latestFrame.length);
-        res.setHeader('X-Frame-Seq', String(cam.frameCounter));
-        res.end(cam.latestFrame);
-      } else {
-        res.status(204).send();
-      }
-    } catch (e) {}
-  }, 12000);
-
-  req.on('close', () => {
-    clearTimeout(timeoutTimer);
-    const idx = frameWaiters[camId] ? frameWaiters[camId].indexOf(res) : -1;
-    if (idx !== -1) frameWaiters[camId].splice(idx, 1);
-  });
-}
-
-app.get('/live-frame', handleLiveFrame);
-app.get('/live-frame/:camId', handleLiveFrame);
-
-// =====================================================================================
-// 3. HD SNAPSHOT / CAPTURE ENDPOINTS (Strict No-Cache for 3-Second Refresh)
-// =====================================================================================
-function handleCaptureRequest(req, res) {
-  const camId = resolveCamId(req);
-  const cam = cameras[camId] || cameras[1];
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-
-  if (cam.latestFrame) {
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Content-Length', cam.latestFrame.length);
-    res.setHeader('X-Frame-Seq', String(cam.frameCounter));
-    res.end(cam.latestFrame);
-  } else {
-    res.setHeader('Content-Type', 'image/svg+xml');
-    res.status(200).send(`<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480">
-      <rect width="640" height="480" fill="#0b0f19"/>
-      <circle cx="320" cy="200" r="50" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
-      <circle cx="320" cy="200" r="22" fill="#38bdf8"/>
-      <text x="50%" y="295" dominant-baseline="middle" text-anchor="middle" fill="#38bdf8" font-family="Segoe UI, sans-serif" font-size="20" font-weight="bold">Camera ${camId} Connecting...</text>
-      <text x="50%" y="330" dominant-baseline="middle" text-anchor="middle" fill="#94a3b8" font-family="Segoe UI, sans-serif" font-size="14">Waiting for live video feed from ESP32</text>
-    </svg>`);
-  }
-}
-
-app.get('/capture', handleCaptureRequest);
-app.get('/capture/:camId', handleCaptureRequest);
-
-// =====================================================================================
-// 4. LEGACY MJPEG STREAM ENDPOINTS (Backwards Compatibility)
+// 2. LIVE MJPEG STREAMS (Supports Cam 1, Cam 2, Cam 3 - Pure MJPEG)
 // =====================================================================================
 function handleStreamRequest(req, res) {
-  const accept = req.headers['accept'] || '';
-  if (accept.includes('text/html')) {
-    return handleAllCamerasAppView(req, res);
-  }
-
   const camId = resolveCamId(req);
   const cam = cameras[camId] || cameras[1];
 
@@ -240,7 +136,7 @@ function handleStreamRequest(req, res) {
   cam.streamClients.push(res);
   console.log(`[Stream Cam ${camId}] Viewer connected. Total viewers: ${cam.streamClients.length}`);
 
-  if (cam.latestFrame) {
+  if (cam.latestFrame && cam.latestFrame.length > 0) {
     res.write('--boundarydonotcross\r\n');
     res.write('Content-Type: image/jpeg\r\n');
     res.write('Content-Length: ' + cam.latestFrame.length + '\r\n\r\n');
@@ -251,6 +147,7 @@ function handleStreamRequest(req, res) {
   req.on('close', () => {
     const idx = cam.streamClients.indexOf(res);
     if (idx !== -1) cam.streamClients.splice(idx, 1);
+    console.log(`[Stream Cam ${camId}] Viewer disconnected. Remaining: ${cam.streamClients.length}`);
   });
 }
 
@@ -258,7 +155,40 @@ app.get('/stream', handleStreamRequest);
 app.get('/stream/:camId', handleStreamRequest);
 
 // =====================================================================================
-// 5. TELEMETRY & MULTI-CAMERA HEALTH STATUS
+// 3. HD SNAPSHOT / 3-SECOND CAPTURE ENDPOINTS (Strict No-Cache)
+// =====================================================================================
+function handleCaptureRequest(req, res) {
+  const camId = resolveCamId(req);
+  const cam = cameras[camId] || cameras[1];
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  if (cam.latestFrame && cam.latestFrame.length > 0) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Content-Length', cam.latestFrame.length);
+    res.setHeader('X-Frame-Time', String(cam.lastFrameTime));
+    return res.end(cam.latestFrame);
+  }
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480">
+    <rect width="640" height="480" fill="#0b0f19"/>
+    <circle cx="320" cy="200" r="45" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+    <circle cx="320" cy="200" r="18" fill="#38bdf8"/>
+    <text x="50%" y="280" dominant-baseline="middle" text-anchor="middle" fill="#38bdf8" font-family="Segoe UI, sans-serif" font-size="20" font-weight="bold">Camera ` + camId + ` Standby</text>
+    <text x="50%" y="315" dominant-baseline="middle" text-anchor="middle" fill="#94a3b8" font-family="Segoe UI, sans-serif" font-size="14">Waiting for first image from ESP32...</text>
+  </svg>`;
+  res.setHeader('Content-Type', 'image/svg+xml');
+  return res.status(200).send(svg);
+}
+
+app.get('/capture', handleCaptureRequest);
+app.get('/capture/:camId', handleCaptureRequest);
+
+// =====================================================================================
+// 4. TELEMETRY & MULTI-CAMERA HEALTH STATUS
 // =====================================================================================
 function handleTelemetry(req, res) {
   const camId = resolveCamId(req);
@@ -274,9 +204,9 @@ app.post('/api/device/telemetry', handleTelemetry);
 
 app.get('/api/status', (req, res) => {
   const now = Date.now();
-  const cam1Live = (now - cameras[1].lastFrameTime) < 15000;
-  const cam2Live = (now - cameras[2].lastFrameTime) < 15000;
-  const cam3Live = (now - cameras[3].lastFrameTime) < 15000;
+  const cam1Live = (now - cameras[1].lastFrameTime) < 30000;
+  const cam2Live = (now - cameras[2].lastFrameTime) < 30000;
+  const cam3Live = (now - cameras[3].lastFrameTime) < 30000;
 
   res.json({
     status: 'online',
@@ -285,7 +215,7 @@ app.get('/api/status', (req, res) => {
       1: {
         name: cameras[1].name,
         live: cam1Live,
-        viewers: (frameWaiters[1]||[]).length + cameras[1].streamClients.length,
+        viewers: cameras[1].streamClients.length,
         frames: cameras[1].frameCounter,
         rssi: cameras[1].telemetry.rssi || -55,
         lastSeen: cameras[1].lastFrameTime ? new Date(cameras[1].lastFrameTime).toISOString() : null
@@ -293,7 +223,7 @@ app.get('/api/status', (req, res) => {
       2: {
         name: cameras[2].name,
         live: cam2Live,
-        viewers: (frameWaiters[2]||[]).length + cameras[2].streamClients.length,
+        viewers: cameras[2].streamClients.length,
         frames: cameras[2].frameCounter,
         rssi: cameras[2].telemetry.rssi || -60,
         lastSeen: cameras[2].lastFrameTime ? new Date(cameras[2].lastFrameTime).toISOString() : null
@@ -301,19 +231,19 @@ app.get('/api/status', (req, res) => {
       3: {
         name: cameras[3].name,
         live: cam3Live,
-        viewers: (frameWaiters[3]||[]).length + cameras[3].streamClients.length,
+        viewers: cameras[3].streamClients.length,
         frames: cameras[3].frameCounter,
         rssi: cameras[3].telemetry.rssi || -60,
         lastSeen: cameras[3].lastFrameTime ? new Date(cameras[3].lastFrameTime).toISOString() : null
       }
     },
-    total_viewers: (frameWaiters[1]||[]).length + (frameWaiters[2]||[]).length + (frameWaiters[3]||[]).length,
+    total_viewers: cameras[1].streamClients.length + cameras[2].streamClients.length + cameras[3].streamClients.length,
     timestamp: new Date().toISOString()
   });
 });
 
 // =====================================================================================
-// 6. HARDWARE BIDIRECTIONAL CONTROL CHANNEL (Camera 1 Actuators)
+// 5. HARDWARE BIDIRECTIONAL CONTROL CHANNEL (Camera 1 Actuators)
 // =====================================================================================
 app.get('/api/device/commands', (req, res) => {
   if (pendingCommands.length > 0) {
@@ -355,7 +285,6 @@ function queueCommand(action, param = '', targetCam = 1) {
   if (pendingCommands.length > 30) pendingCommands.shift();
 }
 
-// Actuator Endpoints
 app.get('/api/panic', (req, res) => {
   queueCommand('alarm');
   res.json({ status: 'ok', msg: 'Emergency SOS Panic Dispatched to ESP32!' });
@@ -441,7 +370,6 @@ app.get('/api/speak', (req, res) => {
   res.json({ status: 'ok', msg: `2-Way Voice Talkback Dispatched: ${label}` });
 });
 
-// Live Speech Walkie-Talkie
 app.post('/api/live-speech', (req, res) => {
   if (req.body && req.body.length > 0) {
     const speechData = req.body;
@@ -474,7 +402,6 @@ app.get('/api/device/speech', (req, res) => {
   }
 });
 
-// APK Download
 function sendApkDownload(req, res) {
   const apkPath = path.join(__dirname, 'CCTVLoki.apk');
   if (fs.existsSync(apkPath)) {
@@ -488,61 +415,58 @@ app.get('/download', sendApkDownload);
 app.get('/app', sendApkDownload);
 
 // =====================================================================================
-// 7. CLEAN FULLSCREEN 3-SECOND AUTO-REFRESH VIEWER (FOR ANDROID APP WEBVIEW)
+// 6. DEDICATED APP VIEW (Optimized for Android App & Fast WebView 3s Auto-Refresh)
 // =====================================================================================
-function handleAppView(req, res) {
-  const camId = resolveCamId(req);
-  res.send(`<!DOCTYPE html>
+app.get('/app-view', (req, res) => {
+  const requestedCam = req.query.cam;
+  
+  if (requestedCam === '1' || requestedCam === '2' || requestedCam === '3') {
+    const cId = parseInt(requestedCam, 10);
+    const cName = cameras[cId].name;
+    return res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Loki CCTV Camera</title>
+  <title>` + cName + `</title>
   <style>
-    * { margin:0; padding:0; box-sizing:border-box; background:#000; }
-    html, body { width:100%; height:100%; overflow:hidden; display:flex; justify-content:center; align-items:center; }
+    * { margin:0; padding:0; box-sizing:border-box; background:#0b0f19; font-family:'Segoe UI',sans-serif; }
+    body { padding:8px; display:flex; flex-direction:column; height:100vh; }
+    .header { background:#1e293b; color:#38bdf8; font-size:13px; font-weight:bold; padding:8px 12px; border-radius:8px 8px 0 0; display:flex; justify-content:space-between; align-items:center; }
+    .badge { font-size:11px; font-weight:bold; background:#064e3b; color:#34d399; padding:2px 8px; border-radius:10px; }
+    .feed { flex:1; background:#000; display:flex; align-items:center; justify-content:center; overflow:hidden; border-radius:0 0 8px 8px; }
     img { width:100%; height:100%; object-fit:contain; }
-    .badge { position:absolute; top:8px; left:8px; background:rgba(6,78,59,0.85); color:#34d399; font-family:sans-serif; font-size:11px; font-weight:bold; padding:4px 10px; border-radius:12px; z-index:10; }
   </style>
 </head>
 <body>
-  <div class="badge" id="b">● 3s AUTO REFRESH</div>
-  <img id="f" src="/capture?cam=` + camId + `" />
+  <div class="header">
+    <span>📹 ` + cName + `</span>
+    <span class="badge" id="b">● 3s AUTO</span>
+  </div>
+  <div class="feed">
+    <img id="f" src="/capture?cam=` + cId + `" alt="Camera Feed" />
+  </div>
   <script>
-    var cId = ` + camId + `;
-    var imgEl = document.getElementById('f');
-    var badgeEl = document.getElementById('b');
-    var activeBlob = null;
-
-    async function tick() {
-      try {
-        var res = await fetch('/capture?cam=' + cId + '&t=' + Date.now());
-        if (res.status === 200) {
-          var blob = await res.blob();
-          if (blob && blob.size > 200) {
-            var url = URL.createObjectURL(blob);
-            imgEl.src = url;
-            if (activeBlob) URL.revokeObjectURL(activeBlob);
-            activeBlob = url;
-            var d = new Date();
-            var timeStr = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0');
-            badgeEl.innerText = '● LIVE (3s: ' + timeStr + ')';
-          }
-        }
-      } catch (e) {}
+    var cId = ` + cId + `;
+    var img = document.getElementById('f');
+    var badge = document.getElementById('b');
+    function updateFrame() {
+      var next = new Image();
+      next.onload = function() {
+        img.src = next.src;
+        var d = new Date();
+        var t = String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0') + ':' + String(d.getSeconds()).padStart(2,'0');
+        badge.innerText = '● LIVE (' + t + ')';
+      };
+      next.src = '/capture?cam=' + cId + '&t=' + Date.now();
     }
-
-    tick();
-    setInterval(tick, 3000);
+    updateFrame();
+    setInterval(updateFrame, 3000);
   </script>
 </body>
 </html>`);
-}
+  }
 
-app.get('/view', handleAppView);
-app.get('/view/:camId', handleAppView);
-
-function handleAllCamerasAppView(req, res) {
   res.send(`<!DOCTYPE html>
 <html>
 <head>
@@ -555,55 +479,53 @@ function handleAllCamerasAppView(req, res) {
     .cam-box { background:#161e2e; border:1px solid #1f293d; border-radius:10px; overflow:hidden; }
     .cam-header { background:#1e293b; color:#38bdf8; font-size:12px; font-weight:bold; padding:6px 10px; display:flex; justify-content:space-between; align-items:center; }
     .badge { font-size:10px; font-weight:bold; background:#064e3b; color:#34d399; padding:2px 8px; border-radius:10px; }
-    .img-wrap { width:100%; height:170px; background:#000; display:flex; align-items:center; justify-content:center; }
+    .img-wrap { width:100%; height:170px; background:#000; display:flex; align-items:center; justify-content:center; overflow:hidden; }
     img { width:100%; height:100%; object-fit:contain; }
   </style>
 </head>
 <body>
   <div class="cam-box">
     <div class="cam-header"><span>📹 CAM 1 (Main S3)</span><span class="badge" id="b1">● 3s AUTO</span></div>
-    <div class="img-wrap"><img id="f1" src="/capture?cam=1" /></div>
+    <div class="img-wrap"><img id="f1" src="/capture?cam=1" alt="Cam 1" /></div>
   </div>
   <div class="cam-box">
     <div class="cam-header"><span>📹 CAM 2 (Side Angle 1)</span><span class="badge" id="b2">● 3s AUTO</span></div>
-    <div class="img-wrap"><img id="f2" src="/capture?cam=2" /></div>
+    <div class="img-wrap"><img id="f2" src="/capture?cam=2" alt="Cam 2" /></div>
   </div>
   <div class="cam-box">
     <div class="cam-header"><span>📹 CAM 3 (Side Angle 2)</span><span class="badge" id="b3">● 3s AUTO</span></div>
-    <div class="img-wrap"><img id="f3" src="/capture?cam=3" /></div>
+    <div class="img-wrap"><img id="f3" src="/capture?cam=3" alt="Cam 3" /></div>
   </div>
   <script>
-    async function updateCam(id) {
-      try {
-        var res = await fetch('/capture?cam=' + id + '&t=' + Date.now());
-        if (res.status === 200) {
-          var blob = await res.blob();
-          if (blob && blob.size > 200) {
-            var url = URL.createObjectURL(blob);
-            var img = document.getElementById('f' + id);
-            img.src = url;
-            if (img._b) URL.revokeObjectURL(img._b);
-            img._b = url;
-            var d = new Date();
-            var timeStr = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0');
-            document.getElementById('b' + id).innerText = '● LIVE (' + timeStr + ')';
-          }
-        }
-      } catch (e) {}
+    function updateCam(id) {
+      var img = document.getElementById('f' + id);
+      var badge = document.getElementById('b' + id);
+      if (!img) return;
+      var next = new Image();
+      next.onload = function() {
+        img.src = next.src;
+        var d = new Date();
+        var t = String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0') + ':' + String(d.getSeconds()).padStart(2,'0');
+        badge.innerText = '● LIVE (' + t + ')';
+      };
+      next.src = '/capture?cam=' + id + '&t=' + Date.now();
     }
-    function tickAll() { updateCam(1); updateCam(2); updateCam(3); }
+    function tickAll() {
+      updateCam(1);
+      updateCam(2);
+      updateCam(3);
+    }
     tickAll();
     setInterval(tickAll, 3000);
   </script>
 </body>
 </html>`);
-}
+});
 
-app.get('/app-view', handleAllCamerasAppView);
-app.get('/view/all', handleAllCamerasAppView);
+app.get('/view/all', (req, res) => { res.redirect('/app-view'); });
 
 // =====================================================================================
-// 8. MODERN TRIPLE-CAMERA DASHBOARD CONSOLE (3-SECOND AUTO-REFRESH & LIVE ENGINE)
+// 7. MODERN TRIPLE-CAMERA DASHBOARD CONSOLE (3-SECOND AUTO-REFRESH & ZERO LAG)
 // =====================================================================================
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
@@ -653,9 +575,8 @@ app.get('/', (req, res) => {
 <body>
   <div class="container">
     <h2>LOKI CCTV TRIPLE-CAMERA HUB <span class="live-indicator"><span class="pulse-dot"></span>24/7 CONSTANT</span></h2>
-    <p class="sub">Permanent Cloud Address | Zero IP Changes | 3-Second Smooth Auto-Refresh</p>
+    <p class="sub">Permanent Cloud Address | Zero IP Changes | Automated 3-Second Refresh</p>
 
-    <!-- Tab View Switcher -->
     <div class="tab-bar">
       <button class="tab-btn active" id="tabAll" onclick="setViewMode('all')">📺 All 3 Cameras (Live Grid)</button>
       <button class="tab-btn" id="tabCam1" onclick="setViewMode('cam1')">📹 Camera 1 (Main S3)</button>
@@ -663,18 +584,15 @@ app.get('/', (req, res) => {
       <button class="tab-btn" id="tabCam3" onclick="setViewMode('cam3')">📹 Camera 3 (Angle 3)</button>
     </div>
 
-    <!-- Auto-Refresh Mode Controls -->
     <div class="rate-bar">
       <span style="font-size:12px; color:#94a3b8; font-weight:bold;">⏱️ Auto-Refresh:</span>
-      <button class="tab-btn active" id="btnRate3" style="padding:6px 12px; font-size:11px;" onclick="setRefreshRate(3000)">⏱️ 3 Seconds (Default)</button>
-      <button class="tab-btn" id="btnRate1" style="padding:6px 12px; font-size:11px;" onclick="setRefreshRate(1000)">⏱️ 1 Second</button>
-      <button class="tab-btn" id="btnRateLive" style="padding:6px 12px; font-size:11px;" onclick="setRefreshRate(0)">⚡ Instant Live</button>
+      <button class="tab-btn active" id="btnRate3" style="padding:6px 12px; font-size:11px;" onclick="setRefreshRate(3000)">⏱️ 3 Seconds (Auto)</button>
+      <button class="tab-btn" id="btnRate1" style="padding:6px 12px; font-size:11px;" onclick="setRefreshRate(1000)">⏱️ 1 Second (Fast)</button>
+      <button class="tab-btn" id="btnRateStream" style="padding:6px 12px; font-size:11px;" onclick="setRefreshRate(0)">⚡ Live Stream (MJPEG)</button>
       <button class="tab-btn" style="padding:6px 12px; font-size:11px; background:#059669; color:white; border-color:#10b981;" onclick="refreshAllCameras()">🔄 Refresh Now</button>
     </div>
 
-    <!-- Multi-Camera Video Layout -->
     <div class="cam-layout all" id="camLayout">
-      <!-- Camera 1 Box -->
       <div class="cam-card" id="cardCam1">
         <div class="cam-header">
           <span>📹 CAM 1 (Main ESP32-S3)</span>
@@ -689,7 +607,6 @@ app.get('/', (req, res) => {
         </div>
       </div>
 
-      <!-- Camera 2 Box -->
       <div class="cam-card" id="cardCam2">
         <div class="cam-header">
           <span>📹 CAM 2 (Side Angle 1)</span>
@@ -704,7 +621,6 @@ app.get('/', (req, res) => {
         </div>
       </div>
 
-      <!-- Camera 3 Box -->
       <div class="cam-card" id="cardCam3">
         <div class="cam-header">
           <span>📹 CAM 3 (Side Angle 2)</span>
@@ -720,13 +636,10 @@ app.get('/', (req, res) => {
       </div>
     </div>
 
-    <!-- Emergency SOS Siren -->
     <button class="sos-btn" onclick="executeApi('/api/panic')">🚨 EMERGENCY SOS ALARM (MAX SOUND + STROBE)</button>
 
-    <!-- Live Push-To-Talk Walkie-Talkie -->
     <button class="btn-orange" style="width:100%;margin-bottom:14px;padding:14px;" id="pttBtn">🗣️ HOLD TO SPEAK (LIVE MIC WALKIE-TALKIE)</button>
 
-    <!-- Camera 1 Actuator Controls -->
     <div class="section-title">Hardware Actuators & Voice Intercom (Camera 1)</div>
     <div class="grid">
       <button class="btn-green" onclick="executeApi('/api/speak?track=5')">🗣️ Voice: Step Away!</button>
@@ -743,51 +656,34 @@ app.get('/', (req, res) => {
       <button class="btn-red" onclick="executeApi('/api/reboot')">🔄 Reboot Main ESP32</button>
     </div>
 
-    <!-- Status & Telemetry Console -->
     <div class="status-box" id="statusBox">
-      Connecting to Telemetry Services...
+      Connecting to Multi-Camera Telemetry Services...
     </div>
   </div>
 
   <script>
-    // ===================================================================================
-    // ZERO-FLICKER AUTO-REFRESH & LIVE PUSH ENGINE
-    // ===================================================================================
-    var currentIntervalMs = 3000; // 3 seconds default
     var refreshTimer = null;
-    var liveStreamActive = false;
+    var currentIntervalMs = 3000;
 
-    async function refreshCamera(camId) {
+    function refreshCamera(camId) {
       var displayImg = document.getElementById('imgCam' + camId);
       var badge = document.getElementById('badgeCam' + camId);
       if (!displayImg) return;
-      try {
-        var res = await fetch('/capture?cam=' + camId + '&t=' + Date.now());
-        if (res.status === 200) {
-          var blob = await res.blob();
-          if (blob && blob.size > 200) {
-            var newUrl = URL.createObjectURL(blob);
-            displayImg.src = newUrl;
-            if (displayImg._activeBlob) {
-              URL.revokeObjectURL(displayImg._activeBlob);
-            }
-            displayImg._activeBlob = newUrl;
-            if (badge) {
-              badge.className = 'badge badge-live';
-              var t = new Date();
-              var h = String(t.getHours()).padStart(2, '0');
-              var m = String(t.getMinutes()).padStart(2, '0');
-              var s = String(t.getSeconds()).padStart(2, '0');
-              badge.innerText = '● LIVE (3s: ' + h + ':' + m + ':' + s + ')';
-            }
-          }
-        }
-      } catch (e) {
+
+      var preloader = new Image();
+      preloader.onload = function() {
+        displayImg.src = preloader.src;
         if (badge) {
-          badge.className = 'badge badge-wait';
-          badge.innerText = 'WAITING...';
+          badge.className = 'badge badge-live';
+          var t = new Date();
+          var h = String(t.getHours()).padStart(2, '0');
+          var m = String(t.getMinutes()).padStart(2, '0');
+          var s = String(t.getSeconds()).padStart(2, '0');
+          badge.innerText = '● LIVE (' + h + ':' + m + ':' + s + ')';
         }
-      }
+      };
+      preloader.onerror = function() {};
+      preloader.src = '/capture?cam=' + camId + '&t=' + Date.now();
     }
 
     function refreshAllCameras() {
@@ -796,51 +692,11 @@ app.get('/', (req, res) => {
       refreshCamera(3);
     }
 
-    // Push-on-Frame Engine (Optional Fast Mode)
-    function startCameraFeed(camId) {
-      var displayImg = document.getElementById('imgCam' + camId);
-      var badge = document.getElementById('badgeCam' + camId);
-      var currentSeq = 0;
-      var activeBlobUrl = null;
-
-      async function fetchStream() {
-        if (!liveStreamActive) return;
-        try {
-          var res = await fetch('/live-frame?cam=' + camId + '&seq=' + currentSeq + '&t=' + Date.now());
-          if (res.status === 200) {
-            var seqHeader = res.headers.get('X-Frame-Seq');
-            if (seqHeader) {
-              currentSeq = parseInt(seqHeader, 10);
-            } else {
-              currentSeq++;
-            }
-            var blob = await res.blob();
-            if (blob && blob.size > 200) {
-              var newUrl = URL.createObjectURL(blob);
-              displayImg.src = newUrl;
-              if (activeBlobUrl) URL.revokeObjectURL(activeBlobUrl);
-              activeBlobUrl = newUrl;
-              if (badge) {
-                badge.className = 'badge badge-live';
-                badge.innerText = '● LIVE (INSTANT)';
-              }
-            }
-            if (liveStreamActive) fetchStream();
-          } else {
-            if (liveStreamActive) setTimeout(fetchStream, 300);
-          }
-        } catch (err) {
-          if (liveStreamActive) setTimeout(fetchStream, 800);
-        }
-      }
-      fetchStream();
-    }
-
     function setRefreshRate(ms) {
       currentIntervalMs = ms;
       document.getElementById('btnRate3').classList.remove('active');
       document.getElementById('btnRate1').classList.remove('active');
-      document.getElementById('btnRateLive').classList.remove('active');
+      document.getElementById('btnRateStream').classList.remove('active');
 
       if (refreshTimer) {
         clearInterval(refreshTimer);
@@ -849,24 +705,20 @@ app.get('/', (req, res) => {
 
       if (ms === 3000) {
         document.getElementById('btnRate3').classList.add('active');
-        liveStreamActive = false;
         refreshAllCameras();
         refreshTimer = setInterval(refreshAllCameras, 3000);
       } else if (ms === 1000) {
         document.getElementById('btnRate1').classList.add('active');
-        liveStreamActive = false;
         refreshAllCameras();
         refreshTimer = setInterval(refreshAllCameras, 1000);
       } else if (ms === 0) {
-        document.getElementById('btnRateLive').classList.add('active');
-        liveStreamActive = true;
-        startCameraFeed(1);
-        startCameraFeed(2);
-        startCameraFeed(3);
+        document.getElementById('btnRateStream').classList.add('active');
+        document.getElementById('imgCam1').src = '/stream?cam=1';
+        document.getElementById('imgCam2').src = '/stream?cam=2';
+        document.getElementById('imgCam3').src = '/stream?cam=3';
       }
     }
 
-    // Default startup: 3-Second Auto-Refresh
     window.addEventListener('DOMContentLoaded', function() {
       setRefreshRate(3000);
     });
@@ -926,18 +778,21 @@ app.get('/', (req, res) => {
 
     async function fetchStatus() {
       try {
-        var res = await fetch('/api/status');
+        var res = await fetch('/api/status?t=' + Date.now());
         var data = await res.json();
 
         var c1Live = data.cameras && data.cameras[1] && data.cameras[1].live;
         var c2Live = data.cameras && data.cameras[2] && data.cameras[2].live;
         var c3Live = data.cameras && data.cameras[3] && data.cameras[3].live;
 
-        document.getElementById('statusBox').innerHTML = 
-          '<b>Camera 1 (Main S3):</b> ' + (c1Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">OFFLINE</span>') + ' | Signal: ' + (data.cameras[1].rssi || '-55') + ' dBm | Frames Ingested: ' + (data.cameras[1].frames || 0) + '<br>' +
-          '<b>Camera 2 (Angle 2):</b> ' + (c2Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">WAITING</span>') + ' | Signal: ' + (data.cameras[2].rssi || '-60') + ' dBm | Frames Ingested: ' + (data.cameras[2].frames || 0) + '<br>' +
-          '<b>Camera 3 (Angle 3):</b> ' + (c3Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">WAITING</span>') + ' | Signal: ' + (data.cameras[3].rssi || '-60') + ' dBm | Frames Ingested: ' + (data.cameras[3].frames || 0) + '<br>' +
-          '<b>Refresh Engine:</b> <span style="color:#38bdf8;">ACTIVE (' + (currentIntervalMs ? (currentIntervalMs/1000) + 's' : 'Instant') + ')</span> | Viewers: ' + (data.total_viewers || 0);
+        var box = document.getElementById('statusBox');
+        if (box) {
+          box.innerHTML =
+            '<b>Camera 1 (Main S3):</b> ' + (c1Live ? '<span style=\"color:#34d399;\">ONLINE</span>' : '<span style=\"color:#f87171;\">OFFLINE</span>') + ' | Signal: ' + ((data.cameras[1] && data.cameras[1].rssi) || '-55') + ' dBm | Frames: ' + ((data.cameras[1] && data.cameras[1].frames) || 0) + '<br>' +
+            '<b>Camera 2 (Side Angle 1):</b> ' + (c2Live ? '<span style=\"color:#34d399;\">ONLINE</span>' : '<span style=\"color:#f87171;\">WAITING</span>') + ' | Signal: ' + ((data.cameras[2] && data.cameras[2].rssi) || '-60') + ' dBm | Frames: ' + ((data.cameras[2] && data.cameras[2].frames) || 0) + '<br>' +
+            '<b>Camera 3 (Side Angle 2):</b> ' + (c3Live ? '<span style=\"color:#34d399;\">ONLINE</span>' : '<span style=\"color:#f87171;\">WAITING</span>') + ' | Signal: ' + ((data.cameras[3] && data.cameras[3].rssi) || '-60') + ' dBm | Frames: ' + ((data.cameras[3] && data.cameras[3].frames) || 0) + '<br>' +
+            '<b>Total Cloud Viewers:</b> ' + (data.total_viewers || 0);
+        }
       } catch (e) {}
     }
     fetchStatus();
@@ -979,7 +834,6 @@ app.get('/', (req, res) => {
     applyRot(2);
     applyRot(3);
 
-    // Push To Talk Live Walkie-Talkie
     var pBtn = document.getElementById('pttBtn');
     var pttStream, pttProc, pttCtx, pcmData = [];
 
@@ -1023,12 +877,12 @@ app.get('/', (req, res) => {
           pBtn.style.background = '#059669';
           setTimeout(function() {
             pBtn.innerText = '🗣️ HOLD TO SPEAK (LIVE MIC WALKIE-TALKIE)';
-            pBtn.style.background = '#ea580c';
+            pBtn.style.background = '#d97706';
           }, 1500);
         }).catch(function(err) {
           alert('Failed to send speech: ' + err.message);
           pBtn.innerText = '🗣️ HOLD TO SPEAK (LIVE MIC WALKIE-TALKIE)';
-          pBtn.style.background = '#ea580c';
+          pBtn.style.background = '#d97706';
         });
       }
       pttStream = null;
