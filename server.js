@@ -220,6 +220,11 @@ app.get('/capture/:camId', handleCaptureRequest);
 // 4. LEGACY MJPEG STREAM ENDPOINTS (Backwards Compatibility)
 // =====================================================================================
 function handleStreamRequest(req, res) {
+  const accept = req.headers['accept'] || '';
+  if (accept.includes('text/html')) {
+    return handleAllCamerasAppView(req, res);
+  }
+
   const camId = resolveCamId(req);
   const cam = cameras[camId] || cameras[1];
 
@@ -536,6 +541,66 @@ function handleAppView(req, res) {
 
 app.get('/view', handleAppView);
 app.get('/view/:camId', handleAppView);
+
+function handleAllCamerasAppView(req, res) {
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Loki CCTV 3-Camera Live Display</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',sans-serif; background:#0b0f19; }
+    body { padding:8px; display:flex; flex-direction:column; gap:10px; }
+    .cam-box { background:#161e2e; border:1px solid #1f293d; border-radius:10px; overflow:hidden; }
+    .cam-header { background:#1e293b; color:#38bdf8; font-size:12px; font-weight:bold; padding:6px 10px; display:flex; justify-content:space-between; align-items:center; }
+    .badge { font-size:10px; font-weight:bold; background:#064e3b; color:#34d399; padding:2px 8px; border-radius:10px; }
+    .img-wrap { width:100%; height:170px; background:#000; display:flex; align-items:center; justify-content:center; }
+    img { width:100%; height:100%; object-fit:contain; }
+  </style>
+</head>
+<body>
+  <div class="cam-box">
+    <div class="cam-header"><span>📹 CAM 1 (Main S3)</span><span class="badge" id="b1">● 3s AUTO</span></div>
+    <div class="img-wrap"><img id="f1" src="/capture?cam=1" /></div>
+  </div>
+  <div class="cam-box">
+    <div class="cam-header"><span>📹 CAM 2 (Side Angle 1)</span><span class="badge" id="b2">● 3s AUTO</span></div>
+    <div class="img-wrap"><img id="f2" src="/capture?cam=2" /></div>
+  </div>
+  <div class="cam-box">
+    <div class="cam-header"><span>📹 CAM 3 (Side Angle 2)</span><span class="badge" id="b3">● 3s AUTO</span></div>
+    <div class="img-wrap"><img id="f3" src="/capture?cam=3" /></div>
+  </div>
+  <script>
+    async function updateCam(id) {
+      try {
+        var res = await fetch('/capture?cam=' + id + '&t=' + Date.now());
+        if (res.status === 200) {
+          var blob = await res.blob();
+          if (blob && blob.size > 200) {
+            var url = URL.createObjectURL(blob);
+            var img = document.getElementById('f' + id);
+            img.src = url;
+            if (img._b) URL.revokeObjectURL(img._b);
+            img._b = url;
+            var d = new Date();
+            var timeStr = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') + ':' + String(d.getSeconds()).padStart(2, '0');
+            document.getElementById('b' + id).innerText = '● LIVE (' + timeStr + ')';
+          }
+        }
+      } catch (e) {}
+    }
+    function tickAll() { updateCam(1); updateCam(2); updateCam(3); }
+    tickAll();
+    setInterval(tickAll, 3000);
+  </script>
+</body>
+</html>`);
+}
+
+app.get('/app-view', handleAllCamerasAppView);
+app.get('/view/all', handleAllCamerasAppView);
 
 // =====================================================================================
 // 8. MODERN TRIPLE-CAMERA DASHBOARD CONSOLE (3-SECOND AUTO-REFRESH & LIVE ENGINE)
