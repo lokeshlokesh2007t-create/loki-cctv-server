@@ -64,6 +64,9 @@ const cameras = {
   }
 };
 
+// Zero-Latency Push-on-Frame Listeners
+const frameWaiters = { 1: [], 2: [], 3: [] };
+
 let pendingCommands = [];
 let commandCounter = 1;
 let cameraStreamClient = null; // Real-Time Push Tunnel Socket
@@ -78,7 +81,7 @@ function resolveCamId(req) {
 }
 
 // =====================================================================================
-// 1. FRAME INGESTION ENDPOINTS (Supports All 3 Cameras)
+// 1. FRAME INGESTION ENDPOINTS (Ultra-Fast Event Dispatching)
 // =====================================================================================
 function handleFrameUpload(req, res) {
   const camId = resolveCamId(req);
@@ -89,11 +92,24 @@ function handleFrameUpload(req, res) {
     cam.lastFrameTime = Date.now();
     cam.frameCounter++;
 
-    if (cam.frameCounter === 1 || cam.frameCounter % 20 === 0) {
-      console.log(`[Frame Cam ${camId}] Ingested frame #${cam.frameCounter} (${cam.latestFrame.length} bytes). Viewers: ${cam.streamClients.length}`);
+    if (cam.frameCounter === 1 || cam.frameCounter % 30 === 0) {
+      console.log(`[Frame Cam ${camId}] Ingested frame #${cam.frameCounter} (${cam.latestFrame.length} bytes). Push-Listeners: ${(frameWaiters[camId]||[]).length}`);
     }
 
-    // Broadcast frame to all active MJPEG viewers of this specific camera
+    // 1. INSTANT PUSH DISPATCH: Send immediately to all waiting browser viewers (0ms Latency)
+    const waiters = frameWaiters[camId] || [];
+    frameWaiters[camId] = [];
+    for (let i = 0; i < waiters.length; i++) {
+      try {
+        const clientRes = waiters[i];
+        clientRes.setHeader('Content-Type', 'image/jpeg');
+        clientRes.setHeader('Content-Length', cam.latestFrame.length);
+        clientRes.setHeader('X-Frame-Seq', String(cam.frameCounter));
+        clientRes.end(cam.latestFrame);
+      } catch (e) {}
+    }
+
+    // 2. Broadcast to legacy MJPEG viewers
     for (let i = cam.streamClients.length - 1; i >= 0; i--) {
       const client = cam.streamClients[i];
       try {
@@ -106,6 +122,7 @@ function handleFrameUpload(req, res) {
         cam.streamClients.splice(i, 1);
       }
     }
+
     res.status(200).send('OK');
   } else {
     res.status(400).send('No Frame Data');
@@ -118,7 +135,89 @@ app.post('/api/device/frame', handleFrameUpload);
 app.post('/api/device/frame/:camId', handleFrameUpload);
 
 // =====================================================================================
-// 2. LIVE MJPEG STREAMS (Supports Cam 1, Cam 2, Cam 3)
+// 2. ZERO-LATENCY PUSH-ON-FRAME STREAMING (Lightning Fast)
+// =====================================================================================
+function handleLiveFrame(req, res) {
+  const camId = resolveCamId(req);
+  const cam = cameras[camId] || cameras[1];
+  const clientSeq = parseInt(req.query.seq || '0', 10);
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  // If server already has a newer frame than what client has seen, send it immediately in 0ms!
+  if (cam.latestFrame && cam.frameCounter > clientSeq) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Content-Length', cam.latestFrame.length);
+    res.setHeader('X-Frame-Seq', String(cam.frameCounter));
+    return res.end(cam.latestFrame);
+  }
+
+  // Otherwise hold connection and flush immediately the exact millisecond ESP32 pushes!
+  if (!frameWaiters[camId]) frameWaiters[camId] = [];
+  frameWaiters[camId].push(res);
+
+  const timeoutTimer = setTimeout(() => {
+    const idx = frameWaiters[camId] ? frameWaiters[camId].indexOf(res) : -1;
+    if (idx !== -1) frameWaiters[camId].splice(idx, 1);
+    try {
+      if (cam.latestFrame) {
+        res.setHeader('Content-Type', 'image/jpeg');
+        res.setHeader('Content-Length', cam.latestFrame.length);
+        res.setHeader('X-Frame-Seq', String(cam.frameCounter));
+        res.end(cam.latestFrame);
+      } else {
+        res.status(204).send();
+      }
+    } catch (e) {}
+  }, 12000);
+
+  req.on('close', () => {
+    clearTimeout(timeoutTimer);
+    const idx = frameWaiters[camId] ? frameWaiters[camId].indexOf(res) : -1;
+    if (idx !== -1) frameWaiters[camId].splice(idx, 1);
+  });
+}
+
+app.get('/live-frame', handleLiveFrame);
+app.get('/live-frame/:camId', handleLiveFrame);
+
+// =====================================================================================
+// 3. HD SNAPSHOT / CAPTURE ENDPOINTS
+// =====================================================================================
+function handleCaptureRequest(req, res) {
+  const camId = resolveCamId(req);
+  const cam = cameras[camId] || cameras[1];
+
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
+  if (cam.latestFrame) {
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Content-Length', cam.latestFrame.length);
+    res.setHeader('X-Frame-Seq', String(cam.frameCounter));
+    res.end(cam.latestFrame);
+  } else {
+    res.setHeader('Content-Type', 'image/svg+xml');
+    res.status(200).send(`<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480">
+      <rect width="640" height="480" fill="#0b0f19"/>
+      <circle cx="320" cy="200" r="50" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+      <circle cx="320" cy="200" r="22" fill="#38bdf8"/>
+      <text x="50%" y="295" dominant-baseline="middle" text-anchor="middle" fill="#38bdf8" font-family="Segoe UI, sans-serif" font-size="20" font-weight="bold">Camera ${camId} Connecting...</text>
+      <text x="50%" y="330" dominant-baseline="middle" text-anchor="middle" fill="#94a3b8" font-family="Segoe UI, sans-serif" font-size="14">Waiting for live video feed from ESP32</text>
+    </svg>`);
+  }
+}
+
+app.get('/capture', handleCaptureRequest);
+app.get('/capture/:camId', handleCaptureRequest);
+
+// =====================================================================================
+// 4. LEGACY MJPEG STREAM ENDPOINTS (Backwards Compatibility)
 // =====================================================================================
 function handleStreamRequest(req, res) {
   const camId = resolveCamId(req);
@@ -136,7 +235,6 @@ function handleStreamRequest(req, res) {
   cam.streamClients.push(res);
   console.log(`[Stream Cam ${camId}] Viewer connected. Total viewers: ${cam.streamClients.length}`);
 
-  // Send current frame immediately if available
   if (cam.latestFrame) {
     res.write('--boundarydonotcross\r\n');
     res.write('Content-Type: image/jpeg\r\n');
@@ -148,7 +246,6 @@ function handleStreamRequest(req, res) {
   req.on('close', () => {
     const idx = cam.streamClients.indexOf(res);
     if (idx !== -1) cam.streamClients.splice(idx, 1);
-    console.log(`[Stream Cam ${camId}] Viewer disconnected. Remaining: ${cam.streamClients.length}`);
   });
 }
 
@@ -156,29 +253,7 @@ app.get('/stream', handleStreamRequest);
 app.get('/stream/:camId', handleStreamRequest);
 
 // =====================================================================================
-// 3. HD SNAPSHOT ENDPOINTS
-// =====================================================================================
-function handleCaptureRequest(req, res) {
-  const camId = resolveCamId(req);
-  const cam = cameras[camId] || cameras[1];
-
-  if (cam.latestFrame) {
-    res.writeHead(200, {
-      'Content-Type': 'image/jpeg',
-      'Content-Length': cam.latestFrame.length,
-      'Access-Control-Allow-Origin': '*'
-    });
-    res.end(cam.latestFrame);
-  } else {
-    res.status(503).json({ error: `Camera ${camId} offline or waiting for first frame` });
-  }
-}
-
-app.get('/capture', handleCaptureRequest);
-app.get('/capture/:camId', handleCaptureRequest);
-
-// =====================================================================================
-// 4. TELEMETRY & MULTI-CAMERA HEALTH STATUS
+// 5. TELEMETRY & MULTI-CAMERA HEALTH STATUS
 // =====================================================================================
 function handleTelemetry(req, res) {
   const camId = resolveCamId(req);
@@ -205,7 +280,7 @@ app.get('/api/status', (req, res) => {
       1: {
         name: cameras[1].name,
         live: cam1Live,
-        viewers: cameras[1].streamClients.length,
+        viewers: (frameWaiters[1]||[]).length + cameras[1].streamClients.length,
         frames: cameras[1].frameCounter,
         rssi: cameras[1].telemetry.rssi || -55,
         lastSeen: cameras[1].lastFrameTime ? new Date(cameras[1].lastFrameTime).toISOString() : null
@@ -213,7 +288,7 @@ app.get('/api/status', (req, res) => {
       2: {
         name: cameras[2].name,
         live: cam2Live,
-        viewers: cameras[2].streamClients.length,
+        viewers: (frameWaiters[2]||[]).length + cameras[2].streamClients.length,
         frames: cameras[2].frameCounter,
         rssi: cameras[2].telemetry.rssi || -60,
         lastSeen: cameras[2].lastFrameTime ? new Date(cameras[2].lastFrameTime).toISOString() : null
@@ -221,19 +296,19 @@ app.get('/api/status', (req, res) => {
       3: {
         name: cameras[3].name,
         live: cam3Live,
-        viewers: cameras[3].streamClients.length,
+        viewers: (frameWaiters[3]||[]).length + cameras[3].streamClients.length,
         frames: cameras[3].frameCounter,
         rssi: cameras[3].telemetry.rssi || -60,
         lastSeen: cameras[3].lastFrameTime ? new Date(cameras[3].lastFrameTime).toISOString() : null
       }
     },
-    total_viewers: cameras[1].streamClients.length + cameras[2].streamClients.length + cameras[3].streamClients.length,
+    total_viewers: (frameWaiters[1]||[]).length + (frameWaiters[2]||[]).length + (frameWaiters[3]||[]).length,
     timestamp: new Date().toISOString()
   });
 });
 
 // =====================================================================================
-// 5. HARDWARE BIDIRECTIONAL CONTROL CHANNEL (Camera 1 Actuators)
+// 6. HARDWARE BIDIRECTIONAL CONTROL CHANNEL (Camera 1 Actuators)
 // =====================================================================================
 app.get('/api/device/commands', (req, res) => {
   if (pendingCommands.length > 0) {
@@ -408,7 +483,7 @@ app.get('/download', sendApkDownload);
 app.get('/app', sendApkDownload);
 
 // =====================================================================================
-// 6. MODERN TRIPLE-CAMERA DASHBOARD CONSOLE (3-SPLIT & TAB SELECTOR)
+// 7. MODERN TRIPLE-CAMERA DASHBOARD CONSOLE (ZERO-LATENCY BLOB ENGINE)
 // =====================================================================================
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
@@ -418,26 +493,29 @@ app.get('/', (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Loki CCTV - Triple-Camera Security Console</title>
   <style>
-    * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, sans-serif; }
+    * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
     body { background: #0b0f19; color: #f8fafc; margin: 0; padding: 16px; display: flex; justify-content: center; }
-    .container { max-width: 1050px; width: 100%; background: #161e2e; border: 1px solid #1f293d; border-radius: 16px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.6); }
-    h2 { color: #38bdf8; margin: 0 0 4px 0; text-align: center; }
+    .container { max-width: 1100px; width: 100%; background: #161e2e; border: 1px solid #1f293d; border-radius: 16px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.6); }
+    h2 { color: #38bdf8; margin: 0 0 4px 0; text-align: center; letter-spacing: 0.5px; }
     p.sub { text-align: center; color: #94a3b8; font-size: 13px; margin: 0 0 16px 0; }
+    .live-indicator { display: inline-flex; align-items: center; gap: 6px; background: #064e3b; color: #34d399; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; margin-left: 8px; }
+    .pulse-dot { width: 8px; height: 8px; background: #34d399; border-radius: 50%; animation: pulse 1.4s infinite; }
+    @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.3; transform: scale(1.3); } 100% { opacity: 1; transform: scale(1); } }
     .tab-bar { display: flex; gap: 8px; justify-content: center; margin-bottom: 16px; flex-wrap: wrap; }
     .tab-btn { background: #1e293b; color: #94a3b8; border: 1px solid #334155; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: bold; cursor: pointer; transition: 0.2s; }
     .tab-btn.active { background: #0284c7; color: white; border-color: #38bdf8; }
     .cam-layout { display: grid; gap: 14px; margin-bottom: 16px; }
-    .cam-layout.all { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .cam-layout.all { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
     .cam-layout.single { grid-template-columns: 1fr; }
-    .cam-card { background: #0f172a; border: 1px solid #334155; border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
-    .cam-header { background: #1e293b; padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; font-size: 12px; font-weight: bold; }
-    .cam-feed { width: 100%; height: 240px; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; }
-    .cam-feed img { width: 100%; height: 100%; object-fit: contain; }
+    .cam-card { background: #0f172a; border: 1px solid #334155; border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+    .cam-header { background: #1e293b; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: bold; }
+    .cam-feed { width: 100%; height: 260px; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; position: relative; }
+    .cam-feed img { width: 100%; height: 100%; object-fit: contain; transition: transform 0.2s; }
     .cam-footer { padding: 8px 12px; display: flex; gap: 8px; background: #161e2e; }
-    .badge { padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; }
-    .badge-live { background: #064e3b; color: #34d399; }
-    .badge-wait { background: #7f1d1d; color: #f87171; }
-    .section-title { font-size: 12px; font-weight: bold; color: #38bdf8; text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 8px 0; }
+    .badge { padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+    .badge-live { background: #064e3b; color: #34d399; border: 1px solid #059669; }
+    .badge-wait { background: #7f1d1d; color: #f87171; border: 1px solid #dc2626; }
+    .section-title { font-size: 12px; font-weight: bold; color: #38bdf8; text-transform: uppercase; letter-spacing: 1px; margin: 18px 0 8px 0; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
     button { padding: 12px; font-size: 13px; font-weight: bold; border-radius: 8px; border: none; cursor: pointer; transition: 0.2s; }
     button:hover { opacity: 0.9; transform: translateY(-1px); }
@@ -448,20 +526,20 @@ app.get('/', (req, res) => {
     .btn-orange { background: #d97706; color: white; }
     .btn-gray { background: #334155; color: white; }
     .sos-btn { width: 100%; background: #991b1b; border: 2px solid #ef4444; color: white; padding: 14px; font-size: 15px; font-weight: 900; border-radius: 10px; margin-bottom: 14px; cursor: pointer; }
-    .status-box { background: #0f172a; padding: 12px; border-radius: 8px; font-size: 12px; color: #cbd5e1; border: 1px solid #1e293b; margin-top: 14px; line-height: 1.5; }
+    .status-box { background: #0f172a; padding: 12px; border-radius: 8px; font-size: 12px; color: #cbd5e1; border: 1px solid #1e293b; margin-top: 14px; line-height: 1.6; }
   </style>
 </head>
 <body>
   <div class="container">
-    <h2>LOKI CCTV MULTI-ANGLE HUB</h2>
-    <p class="sub">24/7 Triple-Camera Cloud Console & Real-Time Security</p>
+    <h2>LOKI CCTV TRIPLE-CAMERA HUB <span class="live-indicator"><span class="pulse-dot"></span>FAST 24/7 STREAM</span></h2>
+    <p class="sub">Ultra-Fast Push Engine | Instant Motion Display | Zero Refresh Needed</p>
 
     <!-- Tab View Switcher -->
     <div class="tab-bar">
-      <button class="tab-btn active" id="tabAll" onclick="setViewMode('all')">📺 Triple View (All 3)</button>
-      <button class="tab-btn" id="tabCam1" onclick="setViewMode('cam1')">📹 Cam 1 (Main S3)</button>
-      <button class="tab-btn" id="tabCam2" onclick="setViewMode('cam2')">📹 Cam 2 (Angle 2)</button>
-      <button class="tab-btn" id="tabCam3" onclick="setViewMode('cam3')">📹 Cam 3 (Angle 3)</button>
+      <button class="tab-btn active" id="tabAll" onclick="setViewMode('all')">📺 All 3 Cameras (Live Grid)</button>
+      <button class="tab-btn" id="tabCam1" onclick="setViewMode('cam1')">📹 Camera 1 (Main S3)</button>
+      <button class="tab-btn" id="tabCam2" onclick="setViewMode('cam2')">📹 Camera 2 (Angle 2)</button>
+      <button class="tab-btn" id="tabCam3" onclick="setViewMode('cam3')">📹 Camera 3 (Angle 3)</button>
     </div>
 
     <!-- Multi-Camera Video Layout -->
@@ -470,14 +548,14 @@ app.get('/', (req, res) => {
       <div class="cam-card" id="cardCam1">
         <div class="cam-header">
           <span>📹 CAM 1 (Main ESP32-S3)</span>
-          <span class="badge badge-wait" id="badgeCam1">CHECKING...</span>
+          <span class="badge badge-wait" id="badgeCam1">CONNECTING...</span>
         </div>
         <div class="cam-feed">
-          <img id="imgCam1" src="/stream?cam=1" alt="Camera 1 Feed" onerror="this.alt='Connecting to Cam 1...';" />
+          <img id="imgCam1" src="/capture?cam=1" alt="Camera 1 Feed" />
         </div>
         <div class="cam-footer">
           <button class="btn-blue" style="flex:1;padding:8px;" id="rotBtn1" onclick="cycleRotate(1)">🔄 Rotate Cam 1</button>
-          <button class="btn-gray" style="flex:1;padding:8px;" onclick="window.open('/capture?cam=1', '_blank')">📸 Snapshot</button>
+          <button class="btn-gray" style="flex:1;padding:8px;" onclick="window.open('/capture?cam=1', '_blank')">📸 HD Snap</button>
         </div>
       </div>
 
@@ -485,14 +563,14 @@ app.get('/', (req, res) => {
       <div class="cam-card" id="cardCam2">
         <div class="cam-header">
           <span>📹 CAM 2 (Side Angle 1)</span>
-          <span class="badge badge-wait" id="badgeCam2">CHECKING...</span>
+          <span class="badge badge-wait" id="badgeCam2">CONNECTING...</span>
         </div>
         <div class="cam-feed">
-          <img id="imgCam2" src="/stream?cam=2" alt="Camera 2 Feed" onerror="this.alt='Connecting to Cam 2...';" />
+          <img id="imgCam2" src="/capture?cam=2" alt="Camera 2 Feed" />
         </div>
         <div class="cam-footer">
           <button class="btn-blue" style="flex:1;padding:8px;" id="rotBtn2" onclick="cycleRotate(2)">🔄 Rotate Cam 2</button>
-          <button class="btn-gray" style="flex:1;padding:8px;" onclick="window.open('/capture?cam=2', '_blank')">📸 Snapshot</button>
+          <button class="btn-gray" style="flex:1;padding:8px;" onclick="window.open('/capture?cam=2', '_blank')">📸 HD Snap</button>
         </div>
       </div>
 
@@ -500,14 +578,14 @@ app.get('/', (req, res) => {
       <div class="cam-card" id="cardCam3">
         <div class="cam-header">
           <span>📹 CAM 3 (Side Angle 2)</span>
-          <span class="badge badge-wait" id="badgeCam3">CHECKING...</span>
+          <span class="badge badge-wait" id="badgeCam3">CONNECTING...</span>
         </div>
         <div class="cam-feed">
-          <img id="imgCam3" src="/stream?cam=3" alt="Camera 3 Feed" onerror="this.alt='Connecting to Cam 3...';" />
+          <img id="imgCam3" src="/capture?cam=3" alt="Camera 3 Feed" />
         </div>
         <div class="cam-footer">
           <button class="btn-blue" style="flex:1;padding:8px;" id="rotBtn3" onclick="cycleRotate(3)">🔄 Rotate Cam 3</button>
-          <button class="btn-gray" style="flex:1;padding:8px;" onclick="window.open('/capture?cam=3', '_blank')">📸 Snapshot</button>
+          <button class="btn-gray" style="flex:1;padding:8px;" onclick="window.open('/capture?cam=3', '_blank')">📸 HD Snap</button>
         </div>
       </div>
     </div>
@@ -542,6 +620,77 @@ app.get('/', (req, res) => {
   </div>
 
   <script>
+    // ===================================================================================
+    // ZERO-LATENCY PUSH-STREAM ENGINE (FETCH + BLOB + ZERO REFRESH)
+    // ===================================================================================
+    function startCameraFeed(camId) {
+      const displayImg = document.getElementById('imgCam' + camId);
+      const badge = document.getElementById('badgeCam' + camId);
+      let currentSeq = 0;
+      let frameCount = 0;
+      let fpsTimer = Date.now();
+      let lastSuccessTime = Date.now();
+      let activeBlobUrl = null;
+
+      async function fetchStream() {
+        try {
+          const res = await fetch('/live-frame?cam=' + camId + '&seq=' + currentSeq + '&t=' + Date.now());
+          if (res.status === 200) {
+            const seqHeader = res.headers.get('X-Frame-Seq');
+            if (seqHeader) {
+              currentSeq = parseInt(seqHeader, 10);
+            } else {
+              currentSeq++;
+            }
+
+            const blob = await res.blob();
+            if (blob && blob.size > 200) {
+              const newUrl = URL.createObjectURL(blob);
+              displayImg.src = newUrl;
+              if (activeBlobUrl) {
+                URL.revokeObjectURL(activeBlobUrl);
+              }
+              activeBlobUrl = newUrl;
+
+              lastSuccessTime = Date.now();
+              frameCount++;
+              const now = Date.now();
+              if (now - fpsTimer >= 1000) {
+                const fps = (frameCount * 1000 / (now - fpsTimer)).toFixed(1);
+                if (badge) {
+                  badge.className = 'badge badge-live';
+                  badge.innerText = '● LIVE (' + fps + ' FPS)';
+                }
+                frameCount = 0;
+                fpsTimer = now;
+              }
+            }
+            // Immediately open next hold connection with zero delay!
+            fetchStream();
+          } else {
+            setTimeout(fetchStream, 200);
+          }
+        } catch (err) {
+          if (Date.now() - lastSuccessTime > 8000 && badge) {
+            badge.className = 'badge badge-wait';
+            badge.innerText = 'CONNECTING...';
+          }
+          setTimeout(fetchStream, 500);
+        }
+      }
+
+      // Initial fast paint from /capture
+      displayImg.src = '/capture?cam=' + camId + '&t=' + Date.now();
+      fetchStream();
+    }
+
+    // Launch all 3 camera streams concurrently on page load
+    window.addEventListener('DOMContentLoaded', () => {
+      startCameraFeed(1);
+      startCameraFeed(2);
+      startCameraFeed(3);
+    });
+
     async function executeApi(endpoint) {
       try {
         const res = await fetch(endpoint);
@@ -604,24 +753,11 @@ app.get('/', (req, res) => {
         const c2Live = data.cameras && data.cameras[2] && data.cameras[2].live;
         const c3Live = data.cameras && data.cameras[3] && data.cameras[3].live;
 
-        const b1 = document.getElementById('badgeCam1');
-        const b2 = document.getElementById('badgeCam2');
-        const b3 = document.getElementById('badgeCam3');
-
-        b1.className = 'badge ' + (c1Live ? 'badge-live' : 'badge-wait');
-        b1.innerText = c1Live ? 'LIVE ONLINE' : 'OFFLINE';
-
-        b2.className = 'badge ' + (c2Live ? 'badge-live' : 'badge-wait');
-        b2.innerText = c2Live ? 'LIVE ONLINE' : 'WAITING FOR FEED';
-
-        b3.className = 'badge ' + (c3Live ? 'badge-live' : 'badge-wait');
-        b3.innerText = c3Live ? 'LIVE ONLINE' : 'WAITING FOR FEED';
-
         document.getElementById('statusBox').innerHTML = 
-          '<b>Camera 1 (Main S3):</b> ' + (c1Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">OFFLINE</span>') + ' | Signal: ' + (data.cameras[1].rssi || '-55') + ' dBm | Frames: ' + (data.cameras[1].frames || 0) + '<br>' +
-          '<b>Camera 2 (Angle 2):</b> ' + (c2Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">WAITING</span>') + ' | Signal: ' + (data.cameras[2].rssi || '-60') + ' dBm | Frames: ' + (data.cameras[2].frames || 0) + '<br>' +
-          '<b>Camera 3 (Angle 3):</b> ' + (c3Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">WAITING</span>') + ' | Signal: ' + (data.cameras[3].rssi || '-60') + ' dBm | Frames: ' + (data.cameras[3].frames || 0) + '<br>' +
-          '<b>Total Cloud Viewers:</b> ' + (data.total_viewers || 0);
+          '<b>Camera 1 (Main S3):</b> ' + (c1Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">OFFLINE</span>') + ' | Signal: ' + (data.cameras[1].rssi || '-55') + ' dBm | Frames Ingested: ' + (data.cameras[1].frames || 0) + '<br>' +
+          '<b>Camera 2 (Angle 2):</b> ' + (c2Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">WAITING</span>') + ' | Signal: ' + (data.cameras[2].rssi || '-60') + ' dBm | Frames Ingested: ' + (data.cameras[2].frames || 0) + '<br>' +
+          '<b>Camera 3 (Angle 3):</b> ' + (c3Live ? '<span style="color:#34d399;">ONLINE</span>' : '<span style="color:#f87171;">WAITING</span>') + ' | Signal: ' + (data.cameras[3].rssi || '-60') + ' dBm | Frames Ingested: ' + (data.cameras[3].frames || 0) + '<br>' +
+          '<b>Triple-Stream Engine:</b> <span style="color:#38bdf8;">ACTIVE (ZERO-LATENCY PUSH)</span> | Total Cloud Viewers: ' + (data.total_viewers || 0);
       } catch (e) {}
     }
     fetchStatus();
